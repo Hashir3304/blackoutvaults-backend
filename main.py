@@ -3,7 +3,7 @@ import json
 import base64
 import stripe
 from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from twilio.rest import Client
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -60,6 +60,37 @@ if twilio_sid and twilio_token:
 async def root():
     return {"message": "✅ Blackout Vault API is running"}
 
+# -------------------------------
+# Create Checkout Session
+# -------------------------------
+@app.post("/create-checkout-session")
+async def create_checkout_session():
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": "usd",
+                        "product_data": {
+                            "name": "Blackout Vault Privacy Plan",
+                        },
+                        "unit_amount": 4999,  # $49.99 in cents
+                    },
+                    "quantity": 1,
+                },
+            ],
+            mode="payment",
+            success_url="https://blackoutvaults.com/success",
+            cancel_url="https://blackoutvaults.com/cancel",
+        )
+        return {"checkout_url": session.url}
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+# -------------------------------
+# Stripe Webhook
+# -------------------------------
 @app.post("/stripe/webhook")
 async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     payload = await request.body()
@@ -73,9 +104,7 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-    # -------------------------------
-    # Handle Stripe Events
-    # -------------------------------
+    # ✅ Payment Success
     if event["type"] == "payment_intent.succeeded":
         payment_intent = event["data"]["object"]
         print("✅ Payment succeeded:", payment_intent["id"])
@@ -93,10 +122,12 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
             except Exception as e:
                 print("⚠️ Twilio send failed:", e)
 
+    # ✅ Checkout Completed
     elif event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         print("✅ Checkout completed:", session["id"])
 
+    # ⚠️ Checkout Expired
     elif event["type"] == "checkout.session.expired":
         print("⚠️ Checkout session expired")
 
@@ -104,3 +135,14 @@ async def stripe_webhook(request: Request, stripe_signature: str = Header(None))
         print("Unhandled event type:", event["type"])
 
     return {"status": "success"}
+
+# -------------------------------
+# Redirect Handlers (optional if you want backend to serve them)
+# -------------------------------
+@app.get("/success")
+async def success():
+    return {"message": "🎉 Payment Successful! Welcome to Blackout Vault."}
+
+@app.get("/cancel")
+async def cancel():
+    return {"message": "❌ Payment was cancelled. Please try again."}
