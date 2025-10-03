@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+stripe
+twilio
+firebase-admin
+python-multipart

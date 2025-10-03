@@ -1,0 +1,17 @@
+# Environment files
+.env
+*.json
+firebase_b64.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.swp
