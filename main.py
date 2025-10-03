@@ -1,148 +1,130 @@
 import os
 import json
-import base64
 import stripe
-from fastapi import FastAPI, Request, Header
-from fastapi.responses import JSONResponse, RedirectResponse
-from twilio.rest import Client
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import credentials
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from email.mime.text import MIMEText
+import aiosmtplib
+from twilio.rest import Client
+import base64
 
 app = FastAPI()
 
-# -------------------------------
+# -----------------------------
 # Stripe Setup
-# -------------------------------
+# -----------------------------
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# -------------------------------
-# Firebase Setup
-# -------------------------------
-firebase_initialized = False
+# -----------------------------
+# Firebase Setup (B64)
+# -----------------------------
 if not firebase_admin._apps:
     firebase_b64 = os.getenv("FIREBASE_B64")
     if firebase_b64:
-        try:
-            firebase_json = base64.b64decode(firebase_b64).decode("utf-8")
-            cred_dict = json.loads(firebase_json)
-            cred = credentials.Certificate(cred_dict)
-            firebase_admin.initialize_app(cred)
-            firebase_initialized = True
-            print("✅ Firebase initialized")
-        except Exception as e:
-            print("⚠️ Firebase init failed:", e)
-else:
-    firebase_initialized = True
+        firebase_json = base64.b64decode(firebase_b64).decode("utf-8")
+        cred = credentials.Certificate(json.loads(firebase_json))
+        firebase_admin.initialize_app(cred)
 
-db = firestore.client() if firebase_initialized else None
-
-# -------------------------------
+# -----------------------------
 # Twilio Setup
-# -------------------------------
-twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
-twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
-twilio_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
-admin_number = os.getenv("ADMIN_WHATSAPP_NUMBER")
+# -----------------------------
+twilio_client = Client(
+    os.getenv("TWILIO_ACCOUNT_SID"),
+    os.getenv("TWILIO_AUTH_TOKEN")
+)
+TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+ADMIN_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
 
-twilio_client = None
-if twilio_sid and twilio_token:
-    try:
-        twilio_client = Client(twilio_sid, twilio_token)
-        print("✅ Twilio client ready")
-    except Exception as e:
-        print("⚠️ Twilio init failed:", e)
+# -----------------------------
+# SMTP Setup
+# -----------------------------
+SMTP_EMAIL = os.getenv("SMTP_EMAIL")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = int(os.getenv("SMTP_PORT"))
+USE_SSL = os.getenv("SMTP_USE_SSL", "True").lower() == "true"
 
-# -------------------------------
+async def send_email(to_email: str, subject: str, body: str):
+    message = MIMEText(body, "html")
+    message["From"] = SMTP_EMAIL
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    if USE_SSL:
+        await aiosmtplib.send(
+            message,
+            hostname=SMTP_SERVER,
+            port=SMTP_PORT,
+            username=SMTP_EMAIL,
+            password=SMTP_PASSWORD,
+            use_tls=True
+        )
+    else:
+        await aiosmtplib.send(
+            message,
+            hostname=SMTP_SERVER,
+            port=SMTP_PORT,
+            username=SMTP_EMAIL,
+            password=SMTP_PASSWORD,
+            start_tls=True
+        )
+
+# -----------------------------
 # Routes
-# -------------------------------
+# -----------------------------
+
 @app.get("/")
 async def root():
     return {"message": "✅ Blackout Vault API is running"}
 
-# -------------------------------
-# Create Checkout Session
-# -------------------------------
-@app.post("/create-checkout-session")
-async def create_checkout_session():
+@app.get("/test-email")
+async def test_email():
     try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": "usd",
-                        "product_data": {
-                            "name": "Blackout Vault Privacy Plan",
-                        },
-                        "unit_amount": 4999,  # $49.99 in cents
-                    },
-                    "quantity": 1,
-                },
-            ],
-            mode="payment",
-            success_url="https://blackoutvaults.com/success",
-            cancel_url="https://blackoutvaults.com/cancel",
+        await send_email(
+            to_email="blackoutvaults@gmail.com",
+            subject="Test Email - Blackout Vaults",
+            body="<h3>✅ SMTP setup works!</h3><p>This is a test email from your backend.</p>"
         )
-        return {"checkout_url": session.url}
+        return {"message": "✅ Test email sent successfully"}
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        return {"error": str(e)}
 
-# -------------------------------
-# Stripe Webhook
-# -------------------------------
 @app.post("/stripe/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
+async def stripe_webhook(request: Request):
     payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
 
     try:
         event = stripe.Webhook.construct_event(
-            payload, stripe_signature, endpoint_secret
+            payload, sig_header, WEBHOOK_SECRET
         )
-    except stripe.error.SignatureVerificationError:
-        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
     except Exception as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
+        raise HTTPException(status_code=400, detail=str(e))
 
-    # ✅ Payment Success
     if event["type"] == "payment_intent.succeeded":
-        payment_intent = event["data"]["object"]
-        print("✅ Payment succeeded:", payment_intent["id"])
+        intent = event["data"]["object"]
+        amount = intent["amount_received"] / 100
+        customer_email = intent.get("receipt_email", "blackoutvaults@gmail.com")
 
-        if db:
-            db.collection("payments").add(payment_intent)
+        # Send Email Receipt
+        await send_email(
+            to_email=customer_email,
+            subject="🧾 Your Blackout Vaults Receipt",
+            body=f"""
+                <h2>Thank you for your payment!</h2>
+                <p>We received <b>${amount:.2f}</b> successfully.</p>
+                <p>Your purchase is being processed by Blackout Vaults.</p>
+            """
+        )
 
-        if twilio_client:
-            try:
-                twilio_client.messages.create(
-                    from_=twilio_number,
-                    body=f"✅ Payment succeeded! ID: {payment_intent['id']}",
-                    to=admin_number
-                )
-            except Exception as e:
-                print("⚠️ Twilio send failed:", e)
+        # Send WhatsApp Admin Alert
+        twilio_client.messages.create(
+            from_=TWILIO_NUMBER,
+            to=ADMIN_NUMBER,
+            body=f"✅ New Stripe payment received: ${amount:.2f} from {customer_email}"
+        )
 
-    # ✅ Checkout Completed
-    elif event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        print("✅ Checkout completed:", session["id"])
-
-    # ⚠️ Checkout Expired
-    elif event["type"] == "checkout.session.expired":
-        print("⚠️ Checkout session expired")
-
-    else:
-        print("Unhandled event type:", event["type"])
-
-    return {"status": "success"}
-
-# -------------------------------
-# Redirect Handlers (optional if you want backend to serve them)
-# -------------------------------
-@app.get("/success")
-async def success():
-    return {"message": "🎉 Payment Successful! Welcome to Blackout Vault."}
-
-@app.get("/cancel")
-async def cancel():
-    return {"message": "❌ Payment was cancelled. Please try again."}
+    return {"message": "✅ Webhook received and processed"}
