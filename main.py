@@ -1,135 +1,149 @@
 import os
-import stripe
 import json
 import base64
-from fastapi import FastAPI, Request, Header
+import stripe
+import smtplib
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from firebase_admin import credentials, initialize_app, storage
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.lib.utils import ImageReader
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
-import aiosmtplib
-from twilio.rest import Client
-import firebase_admin
-from firebase_admin import credentials, storage
+from email import encoders
 
-# --- Initialize FastAPI ---
-app = FastAPI()
+# --- Load ENV ---
+from dotenv import load_dotenv
+load_dotenv()
 
-# --- Stripe Setup ---
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
 STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# --- Twilio Setup ---
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
-twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+# --- SMTP Email ---
+SMTP_EMAIL = os.getenv("SMTP_EMAIL")  # support@blackoutvaults.com
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")  # hosting password
+SMTP_SERVER = os.getenv("SMTP_SERVER")  # mail.blackoutvaults.com
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 
-# --- Firebase Setup (from Base64 env) ---
-firebase_b64 = os.getenv("FIREBASE_CREDENTIALS_B64")
+ADMIN_EMAIL = "support@blackoutvaults.com"
+
+# --- Firebase ---
+firebase_b64 = os.getenv("FIREBASE_SERVICE_ACCOUNT_B64")
 if firebase_b64:
-    cred_json = base64.b64decode(firebase_b64).decode("utf-8")
-    cred_dict = json.loads(cred_json)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred, {"storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET")})
+    temp_path = "temp-firebase.json"
+    with open(temp_path, "w") as f:
+        f.write(base64.b64decode(firebase_b64).decode("utf-8"))
+    cred = credentials.Certificate(temp_path)
+    initialize_app(cred, {"storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET")})
 
-# --- Root Route ---
+# --- Stripe ---
+stripe.api_key = STRIPE_SECRET_KEY
+
+# --- FastAPI app ---
+app = FastAPI()
+
 @app.get("/")
 async def root():
-    return {"message": "✅ Blackout Vault API is running"}
+    return {"message": "✅ Blackout Vault API is running with receipts + SMTP"}
 
-# --- Email Helper ---
-async def send_email(to_email: str, subject: str, body: str):
-    sender = os.getenv("SMTP_EMAIL")
-    password = os.getenv("SMTP_PASSWORD")
-    smtp_server = os.getenv("SMTP_SERVER", "mail.blackoutvaults.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+# === PDF GENERATION ===
+def generate_receipt(session):
+    receipt_path = f"receipt_{session['id']}.pdf"
+    c = canvas.Canvas(receipt_path, pagesize=letter)
+    width, height = letter
 
-    message = MIMEText(body, "html")
-    message["From"] = sender
-    message["To"] = to_email
-    message["Subject"] = subject
+    # Colors
+    black = colors.black
+    yellow = colors.Color(1, 0.85, 0)  # Blackout Vaults Yellow
 
-    await aiosmtplib.send(
-        message,
-        hostname=smtp_server,
-        port=smtp_port,
-        username=sender,
-        password=password,
-        use_tls=True
-    )
+    # Logo
+    logo_path = "assets/logo.png"
+    if os.path.exists(logo_path):
+        logo = ImageReader(logo_path)
+        c.drawImage(logo, 40, height - 100, width=100, height=60, mask='auto')
 
-# --- Test Email Route ---
-@app.get("/test-email")
-async def test_email():
-    try:
-        await send_email(
-            to_email="blackoutvaults@gmail.com",
-            subject="Test Email - Blackout Vaults",
-            body="<h3>✅ SMTP setup works!</h3><p>This is a test email from your backend.</p>"
-        )
-        return {"message": "✅ Test email sent successfully"}
-    except Exception as e:
-        return {"error": str(e)}
+    # Header
+    c.setFillColor(yellow)
+    c.setFont("Helvetica-Bold", 22)
+    c.drawString(160, height - 70, "Blackout Vaults")
 
-# --- Stripe Webhook ---
+    c.setFillColor(black)
+    c.setFont("Helvetica", 12)
+    c.drawString(160, height - 90, "Your Privacy. Professionally Handled.")
+
+    # Divider
+    c.setStrokeColor(yellow)
+    c.setLineWidth(2)
+    c.line(40, height - 110, width - 40, height - 110)
+
+    # Receipt Info
+    c.setFillColor(black)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(40, height - 140, "Payment Receipt")
+
+    c.setFont("Helvetica", 12)
+    c.drawString(40, height - 170, f"Customer Email: {session.get('customer_email', 'N/A')}")
+    c.drawString(40, height - 190, f"Amount Paid: ${session['amount_total']/100:.2f}")
+    c.drawString(40, height - 210, f"Currency: {session['currency'].upper()}")
+    c.drawString(40, height - 230, f"Payment Status: {session['payment_status']}")
+    c.drawString(40, height - 250, f"Session ID: {session['id']}")
+
+    # Footer
+    c.setFont("Helvetica-Oblique", 10)
+    c.setFillColor(black)
+    c.drawString(40, 40, "Thank you for trusting Blackout Vaults.")
+
+    c.save()
+    return receipt_path
+
+# === SEND EMAIL ===
+def send_email(to_email, subject, body, attachment_path=None):
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_EMAIL
+    msg["To"] = to_email
+    msg["Cc"] = ADMIN_EMAIL
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(body, "plain"))
+
+    if attachment_path:
+        with open(attachment_path, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(attachment_path)}")
+            msg.attach(part)
+
+    server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+    server.login(SMTP_EMAIL, SMTP_PASSWORD)
+    server.sendmail(SMTP_EMAIL, [to_email, ADMIN_EMAIL], msg.as_string())
+    server.quit()
+
+# === STRIPE WEBHOOK ===
 @app.post("/stripe/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
+async def stripe_webhook(request: Request):
     payload = await request.body()
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, stripe_signature, STRIPE_WEBHOOK_SECRET
-        )
-    except stripe.error.SignatureVerificationError:
-        return JSONResponse({"error": "Invalid Stripe signature"}, status_code=400)
+    sig_header = request.headers.get("stripe-signature")
 
-    # Handle events
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
-        customer_email = session.get("customer_email")
 
-        # Send Email Receipt
-        if customer_email:
-            await send_email(
-                to_email=customer_email,
-                subject="🧾 Blackout Vaults Receipt",
-                body=f"""
-                <h2>Thank you for your purchase!</h2>
-                <p>Your payment of <b>{session.get('amount_total',0)/100:.2f} {session.get('currency','').upper()}</b> was successful.</p>
-                <p>- Blackout Vaults Team</p>
-                """
-            )
+        receipt = generate_receipt(session)
+        send_email(
+            session.get("customer_email", ADMIN_EMAIL),
+            "Your Blackout Vaults Receipt",
+            "Attached is your official receipt. Thank you for choosing Blackout Vaults.",
+            receipt
+        )
+        return JSONResponse({"status": "✅ Receipt sent"})
 
-        # Send WhatsApp Alert
-        if ADMIN_WHATSAPP_NUMBER:
-            twilio_client.messages.create(
-                from_=TWILIO_WHATSAPP_NUMBER,
-                body=f"✅ New Stripe Checkout completed!\nCustomer: {customer_email}",
-                to=ADMIN_WHATSAPP_NUMBER
-            )
-
-    return {"status": "success"}
-
-# --- Firebase Upload Example ---
-@app.post("/upload")
-async def upload_file(request: Request):
-    data = await request.json()
-    filename = data.get("filename", "test.txt")
-    content = data.get("content", "Hello from Blackout Vaults")
-
-    bucket = storage.bucket()
-    blob = bucket.blob(filename)
-    blob.upload_from_string(content)
-
-    return {"message": f"✅ Uploaded {filename} to Firebase"}
-
-# --- Firebase Download Example ---
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    bucket = storage.bucket()
-    blob = bucket.blob(filename)
-
-    if not blob.exists():
-        return {"error": "File not found"}
-
-    content = blob.download_as_text()
-    return {"filename": filename, "content": content}
+    return JSONResponse({"status": "ignored"})
