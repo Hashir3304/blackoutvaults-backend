@@ -1,114 +1,106 @@
-# main.py
 import os
 import json
 import base64
 import stripe
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
-from twilio.rest import Client as TwilioClient
+from twilio.rest import Client
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# --- Load Environment Variables ---
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
-
-# Firebase Base64 (from Render ENV)
-FIREBASE_B64 = os.getenv("FIREBASE_B64")
-
-# --- Stripe Setup ---
-stripe.api_key = STRIPE_SECRET_KEY
-
-# --- Firebase Setup ---
-if not firebase_admin._apps and FIREBASE_B64:
-    try:
-        decoded_json = base64.b64decode(FIREBASE_B64).decode("utf-8")
-        firebase_credentials = json.loads(decoded_json)
-        cred = credentials.Certificate(firebase_credentials)
-        firebase_admin.initialize_app(cred)
-        db = firestore.client()
-    except Exception as e:
-        print("Firebase init error:", e)
-        db = None
-else:
-    db = None
-
-# --- Twilio Setup ---
-twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    try:
-        twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    except Exception as e:
-        print("Twilio init error:", e)
-
-# --- FastAPI ---
 app = FastAPI()
 
+# -------------------------------
+# Stripe Setup
+# -------------------------------
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
+
+# -------------------------------
+# Firebase Setup
+# -------------------------------
+firebase_initialized = False
+if not firebase_admin._apps:
+    firebase_b64 = os.getenv("FIREBASE_B64")
+    if firebase_b64:
+        try:
+            firebase_json = base64.b64decode(firebase_b64).decode("utf-8")
+            cred_dict = json.loads(firebase_json)
+            cred = credentials.Certificate(cred_dict)
+            firebase_admin.initialize_app(cred)
+            firebase_initialized = True
+            print("✅ Firebase initialized")
+        except Exception as e:
+            print("⚠️ Firebase init failed:", e)
+else:
+    firebase_initialized = True
+
+db = firestore.client() if firebase_initialized else None
+
+# -------------------------------
+# Twilio Setup
+# -------------------------------
+twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+twilio_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
+admin_number = os.getenv("ADMIN_WHATSAPP_NUMBER")
+
+twilio_client = None
+if twilio_sid and twilio_token:
+    try:
+        twilio_client = Client(twilio_sid, twilio_token)
+        print("✅ Twilio client ready")
+    except Exception as e:
+        print("⚠️ Twilio init failed:", e)
+
+# -------------------------------
+# Routes
+# -------------------------------
 @app.get("/")
 async def root():
     return {"message": "✅ Blackout Vault API is running"}
 
-# --- Stripe Webhook ---
 @app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
 
     try:
         event = stripe.Webhook.construct_event(
-            payload, sig_header, STRIPE_WEBHOOK_SECRET
+            payload, stripe_signature, endpoint_secret
         )
+    except stripe.error.SignatureVerificationError:
+        return JSONResponse(status_code=400, content={"error": "Invalid signature"})
     except Exception as e:
         return JSONResponse(status_code=400, content={"error": str(e)})
 
-    if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        customer_email = session.get("customer_email")
-        session_id = session.get("id")
-        amount_total = session.get("amount_total", 0) / 100
+    # -------------------------------
+    # Handle Stripe Events
+    # -------------------------------
+    if event["type"] == "payment_intent.succeeded":
+        payment_intent = event["data"]["object"]
+        print("✅ Payment succeeded:", payment_intent["id"])
 
-        # ✅ Save to Firebase
         if db:
-            db.collection("payments").document(session_id).set({
-                "email": customer_email,
-                "amount": amount_total,
-                "status": "paid"
-            })
-
-        # ✅ WhatsApp message
-        message = f"""
-        ✅ Blackout Vault Payment Confirmed
-        💳 Amount: ${amount_total}
-        📧 Email: {customer_email}
-
-        🔗 Dashboard: https://blackoutvaults.com/dashboard?session_id={session_id}
-        """
+            db.collection("payments").add(payment_intent)
 
         if twilio_client:
             try:
                 twilio_client.messages.create(
-                    from_=TWILIO_WHATSAPP_NUMBER,
-                    body=message,
-                    to=ADMIN_WHATSAPP_NUMBER
+                    from_=twilio_number,
+                    body=f"✅ Payment succeeded! ID: {payment_intent['id']}",
+                    to=admin_number
                 )
             except Exception as e:
-                print("Twilio error:", e)
+                print("⚠️ Twilio send failed:", e)
+
+    elif event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        print("✅ Checkout completed:", session["id"])
+
+    elif event["type"] == "checkout.session.expired":
+        print("⚠️ Checkout session expired")
+
+    else:
+        print("Unhandled event type:", event["type"])
 
     return {"status": "success"}
-
-# --- Stripe Test Endpoint ---
-@app.get("/test-stripe")
-async def test_stripe():
-    return {"status": "Stripe connected", "key": STRIPE_SECRET_KEY[:6] + "****"}
-
-# --- Firebase Test Endpoint ---
-@app.get("/test-firebase")
-async def test_firebase():
-    if not db:
-        return {"error": "Firebase not initialized"}
-    return {"status": "Firebase connected"}
