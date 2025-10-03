@@ -1,85 +1,64 @@
 import os
-import json
 import stripe
-import firebase_admin
-from firebase_admin import credentials
-from fastapi import FastAPI, Request, HTTPException
+import json
+import base64
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import JSONResponse
 from email.mime.text import MIMEText
 import aiosmtplib
 from twilio.rest import Client
-import base64
+import firebase_admin
+from firebase_admin import credentials, storage
 
+# --- Initialize FastAPI ---
 app = FastAPI()
 
-# -----------------------------
-# Stripe Setup
-# -----------------------------
+# --- Stripe Setup ---
 stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")
 
-# -----------------------------
-# Firebase Setup (B64)
-# -----------------------------
-if not firebase_admin._apps:
-    firebase_b64 = os.getenv("FIREBASE_B64")
-    if firebase_b64:
-        firebase_json = base64.b64decode(firebase_b64).decode("utf-8")
-        cred = credentials.Certificate(json.loads(firebase_json))
-        firebase_admin.initialize_app(cred)
+# --- Twilio Setup ---
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
+ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
+twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
-# -----------------------------
-# Twilio Setup
-# -----------------------------
-twilio_client = Client(
-    os.getenv("TWILIO_ACCOUNT_SID"),
-    os.getenv("TWILIO_AUTH_TOKEN")
-)
-TWILIO_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-ADMIN_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
+# --- Firebase Setup (from Base64 env) ---
+firebase_b64 = os.getenv("FIREBASE_CREDENTIALS_B64")
+if firebase_b64:
+    cred_json = base64.b64decode(firebase_b64).decode("utf-8")
+    cred_dict = json.loads(cred_json)
+    cred = credentials.Certificate(cred_dict)
+    firebase_admin.initialize_app(cred, {"storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET")})
 
-# -----------------------------
-# SMTP Setup
-# -----------------------------
-SMTP_EMAIL = os.getenv("SMTP_EMAIL")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-SMTP_SERVER = os.getenv("SMTP_SERVER")
-SMTP_PORT = int(os.getenv("SMTP_PORT"))
-USE_SSL = os.getenv("SMTP_USE_SSL", "True").lower() == "true"
-
-async def send_email(to_email: str, subject: str, body: str):
-    message = MIMEText(body, "html")
-    message["From"] = SMTP_EMAIL
-    message["To"] = to_email
-    message["Subject"] = subject
-
-    if USE_SSL:
-        await aiosmtplib.send(
-            message,
-            hostname=SMTP_SERVER,
-            port=SMTP_PORT,
-            username=SMTP_EMAIL,
-            password=SMTP_PASSWORD,
-            use_tls=True
-        )
-    else:
-        await aiosmtplib.send(
-            message,
-            hostname=SMTP_SERVER,
-            port=SMTP_PORT,
-            username=SMTP_EMAIL,
-            password=SMTP_PASSWORD,
-            start_tls=True
-        )
-
-# -----------------------------
-# Routes
-# -----------------------------
-
+# --- Root Route ---
 @app.get("/")
 async def root():
     return {"message": "✅ Blackout Vault API is running"}
 
+# --- Email Helper ---
+async def send_email(to_email: str, subject: str, body: str):
+    sender = os.getenv("SMTP_EMAIL")
+    password = os.getenv("SMTP_PASSWORD")
+    smtp_server = os.getenv("SMTP_SERVER", "mail.blackoutvaults.com")
+    smtp_port = int(os.getenv("SMTP_PORT", "465"))
+
+    message = MIMEText(body, "html")
+    message["From"] = sender
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    await aiosmtplib.send(
+        message,
+        hostname=smtp_server,
+        port=smtp_port,
+        username=sender,
+        password=password,
+        use_tls=True
+    )
+
+# --- Test Email Route ---
 @app.get("/test-email")
 async def test_email():
     try:
@@ -92,39 +71,65 @@ async def test_email():
     except Exception as e:
         return {"error": str(e)}
 
+# --- Stripe Webhook ---
 @app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
+async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
     payload = await request.body()
-    sig_header = request.headers.get("stripe-signature")
-
     try:
         event = stripe.Webhook.construct_event(
-            payload, sig_header, WEBHOOK_SECRET
+            payload, stripe_signature, STRIPE_WEBHOOK_SECRET
         )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    except stripe.error.SignatureVerificationError:
+        return JSONResponse({"error": "Invalid Stripe signature"}, status_code=400)
 
-    if event["type"] == "payment_intent.succeeded":
-        intent = event["data"]["object"]
-        amount = intent["amount_received"] / 100
-        customer_email = intent.get("receipt_email", "blackoutvaults@gmail.com")
+    # Handle events
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        customer_email = session.get("customer_email")
 
         # Send Email Receipt
-        await send_email(
-            to_email=customer_email,
-            subject="🧾 Your Blackout Vaults Receipt",
-            body=f"""
-                <h2>Thank you for your payment!</h2>
-                <p>We received <b>${amount:.2f}</b> successfully.</p>
-                <p>Your purchase is being processed by Blackout Vaults.</p>
-            """
-        )
+        if customer_email:
+            await send_email(
+                to_email=customer_email,
+                subject="🧾 Blackout Vaults Receipt",
+                body=f"""
+                <h2>Thank you for your purchase!</h2>
+                <p>Your payment of <b>{session.get('amount_total',0)/100:.2f} {session.get('currency','').upper()}</b> was successful.</p>
+                <p>- Blackout Vaults Team</p>
+                """
+            )
 
-        # Send WhatsApp Admin Alert
-        twilio_client.messages.create(
-            from_=TWILIO_NUMBER,
-            to=ADMIN_NUMBER,
-            body=f"✅ New Stripe payment received: ${amount:.2f} from {customer_email}"
-        )
+        # Send WhatsApp Alert
+        if ADMIN_WHATSAPP_NUMBER:
+            twilio_client.messages.create(
+                from_=TWILIO_WHATSAPP_NUMBER,
+                body=f"✅ New Stripe Checkout completed!\nCustomer: {customer_email}",
+                to=ADMIN_WHATSAPP_NUMBER
+            )
 
-    return {"message": "✅ Webhook received and processed"}
+    return {"status": "success"}
+
+# --- Firebase Upload Example ---
+@app.post("/upload")
+async def upload_file(request: Request):
+    data = await request.json()
+    filename = data.get("filename", "test.txt")
+    content = data.get("content", "Hello from Blackout Vaults")
+
+    bucket = storage.bucket()
+    blob = bucket.blob(filename)
+    blob.upload_from_string(content)
+
+    return {"message": f"✅ Uploaded {filename} to Firebase"}
+
+# --- Firebase Download Example ---
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    bucket = storage.bucket()
+    blob = bucket.blob(filename)
+
+    if not blob.exists():
+        return {"error": "File not found"}
+
+    content = blob.download_as_text()
+    return {"filename": filename, "content": content}
