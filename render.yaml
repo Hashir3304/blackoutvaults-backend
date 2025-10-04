@@ -6,13 +6,5 @@ services:
     startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
     plan: free
     envVars:
-      - key: STRIPE_SECRET_KEY
-      - key: STRIPE_PUBLISHABLE_KEY
-      - key: STRIPE_WEBHOOK_SECRET
-      - key: FIREBASE_CREDENTIALS_BASE64
-      - key: FIREBASE_STORAGE_BUCKET
-      - key: TWILIO_ACCOUNT_SID
-      - key: TWILIO_AUTH_TOKEN
-      - key: TWILIO_WHATSAPP_NUMBER
-      - key: ADMIN_WHATSAPP_NUMBER
-      - key: HIBP_API_URL
+      - key: PYTHON_VERSION
+        value: 3.11

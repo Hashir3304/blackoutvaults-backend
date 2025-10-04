@@ -3,4 +3,7 @@ uvicorn
 stripe
 twilio
 firebase-admin
-python-multipart
+python-dotenv
+reportlab
+gunicorn
+pillow
