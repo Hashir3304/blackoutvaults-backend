@@ -2,9 +2,62 @@ services:
   - type: web
     name: blackoutvaults-backend
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
     plan: free
+    region: oregon
+    autoDeploy: true
+
+    # --- Build & Start ---
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --timeout 120
+
+    # --- Environment Variables ---
     envVars:
+      # System
       - key: PYTHON_VERSION
         value: 3.11
+      - key: ENVIRONMENT
+        value: production
+      - key: PORT
+        value: 10000
+
+      # Stripe
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_PUBLISHABLE_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
+      # Firebase
+      - key: FIREBASE_B64
+        sync: false
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: FIREBASE_STORAGE_BUCKET
+        sync: false
+
+      # Email (SMTP)
+      - key: SMTP_SERVER
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_EMAIL
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SUPPORT_EMAIL
+        value: support@blackoutvaults.com
+
+      # WhatsApp (Twilio)
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_WHATSAPP_NUMBER
+        sync: false
+      - key: ADMIN_WHATSAPP_NUMBER
+        sync: false
+
+      # Base URL
+      - key: BASE_URL
+        value: https://blackoutvaults-backend.onrender.com
