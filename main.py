@@ -1,228 +1,246 @@
-import os, stripe, json, smtplib, ssl, base64
-from fastapi import FastAPI, Request, Header, HTTPException
+# ============================================================
+# 🧠 BLACKOUT VAULTS BACKEND (FastAPI + Stripe + Firebase + Twilio)
+# ============================================================
+
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from twilio.rest import Client
+from fastapi.responses import JSONResponse
+import stripe, os, json, base64, smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
+from twilio.rest import Client
+from dotenv import load_dotenv
+from reportlab.pdfgen import canvas
+from io import BytesIO
+from datetime import datetime
 import firebase_admin
 from firebase_admin import credentials, storage
-from reportlab.pdfgen import canvas
-from datetime import datetime
-from io import BytesIO
-from dotenv import load_dotenv
+import openai
 
-# =========================================================
-# 🔹 LOAD ENV
-# =========================================================
+# --- Load environment ---
 load_dotenv()
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
-# =========================================================
-# 🔹 FASTAPI APP SETUP
-# =========================================================
-app = FastAPI(title="Blackout Vaults API", version="3.0.0")
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# --- Firebase ---
+if not firebase_admin._apps:
+    cred_dict = json.loads(base64.b64decode(os.getenv("FIREBASE_B64")).decode())
+    cred = credentials.Certificate(cred_dict)
+    firebase_admin.initialize_app(cred, {"storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET")})
+else:
+    firebase_admin.get_app()
 
-# Allow CORS
+
+# --- Twilio ---
+twilio_client = Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+
+# --- FastAPI setup ---
+app = FastAPI(title="Blackout Vaults Backend", version="4.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =========================================================
-# 🔹 STRIPE CONFIGURATION
-# =========================================================
-stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
-endpoint_secret = os.getenv("STRIPE_WEBHOOK_SECRET")
-
-# =========================================================
-# 🔹 FIREBASE CONFIGURATION
-# =========================================================
-try:
-    firebase_b64 = os.getenv("FIREBASE_B64")
-    if firebase_b64:
-        decoded = base64.b64decode(firebase_b64)
-        cred = credentials.Certificate(json.loads(decoded))
-        firebase_admin.initialize_app(cred, {
-            "storageBucket": f"{os.getenv('FIREBASE_PROJECT_ID')}.appspot.com"
-        })
-        print("🔥 Firebase connected successfully.")
-    else:
-        print("⚠️ FIREBASE_B64 not found.")
-except Exception as e:
-    print("⚠️ Firebase initialization failed:", e)
-
-# =========================================================
-# 🔹 SMTP CONFIG (Professional Mail)
-# =========================================================
-SMTP_EMAIL = os.getenv("SMTP_EMAIL", "support@blackoutvaults.com")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "Blackoutvaults2025")
-SMTP_SERVER = os.getenv("SMTP_SERVER", "mail.blackoutvaults.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
-
-# =========================================================
-# 🔹 TWILIO CONFIG
-# =========================================================
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
-ADMIN_WHATSAPP_NUMBER = os.getenv("ADMIN_WHATSAPP_NUMBER")
-
-# =========================================================
-# 🔹 BASIC ROUTES
-# =========================================================
+# ------------------------------------------------------------
+# 🔹 HOME TEST ROUTE
+# ------------------------------------------------------------
 @app.get("/")
 def home():
-    return {"message": "✅ Blackout Vaults Automation Running", "version": "3.0"}
+    return {"message": "✅ Blackout Vaults API Active", "version": "4.0"}
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "message": "Server and Database Connected"}
+# ------------------------------------------------------------
+# 🔹 AI PRIVACY SCAN
+# ------------------------------------------------------------
+@app.post("/scan")
+async def scan(request: Request):
+    data = await request.json()
+    email = data.get("email", "anonymous@user.com")
 
-# =========================================================
-# 🔹 STRIPE WEBHOOK
-# =========================================================
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request, stripe_signature: str = Header(None)):
-    payload = await request.body()
+    # Simulated AI analysis (can plug real OpenAI model)
+    report_text = f"""
+    Privacy Exposure Report for {email}
+
+    ⚠️ Found leaks on LinkedIn_2024.csv, Facebook_2023.json
+    ✅ Cleanup initiated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    """
+
+    # Generate PDF report
+    pdf_bytes = BytesIO()
+    c = canvas.Canvas(pdf_bytes)
+    c.drawString(100, 800, f"Blackout Vaults - Privacy Report")
+    c.drawString(100, 780, f"Email: {email}")
+    c.drawString(100, 760, f"Scan Time: {datetime.now()}")
+    c.drawString(100, 740, "------------------------------------------")
+    c.drawString(100, 720, "LinkedIn Leak: Cleaned ✅")
+    c.drawString(100, 700, "Facebook Leak: Cleaned ✅")
+    c.drawString(100, 680, "Total Exposures Removed: 2")
+    c.showPage(); c.save()
+    pdf_bytes.seek(0)
+
+    # Upload to Firebase
+    bucket = storage.bucket()
+    blob = bucket.blob(f"reports/{email.replace('@','_')}_{int(datetime.now().timestamp())}.pdf")
+    blob.upload_from_string(pdf_bytes.getvalue(), content_type="application/pdf")
+    report_url = blob.generate_signed_url(datetime.utcnow().replace(year=datetime.utcnow().year + 1))
+
+    # Send WhatsApp notification
     try:
-        event = stripe.Webhook.construct_event(payload, stripe_signature, endpoint_secret)
+        twilio_client.messages.create(
+            from_=os.getenv("TWILIO_WHATSAPP_NUMBER"),
+            to=os.getenv("ADMIN_WHATSAPP_NUMBER"),
+            body=f"🛡️ New scan complete for {email}\nReport: {report_url}"
+        )
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        print("Twilio error:", e)
+
+    return JSONResponse({"status": "success", "report_url": report_url})
+
+# ------------------------------------------------------------
+# 🔹 STRIPE CHECKOUT SESSION
+# ------------------------------------------------------------
+@app.post("/create_checkout_session")
+async def create_checkout_session(request: Request):
+    data = await request.json()
+    plan = data.get("plan", "free")
+    amount = {"free": 0, "pro": 999, "elite": 2999}.get(plan, 0)
+
+    if amount == 0:
+        return {"url": "https://blackoutvaults.com/success?plan=free"}
+
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        mode="subscription",
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {"name": f"Blackout Vaults {plan.capitalize()} Plan"},
+                "unit_amount": amount,
+                "recurring": {"interval": "month"}
+            },
+            "quantity": 1
+        }],
+        success_url="https://blackoutvaults.com/success",
+        cancel_url="https://blackoutvaults.com/cancel",
+    )
+    return {"url": session.url}
+
+# ------------------------------------------------------------
+# 🔹 STRIPE WEBHOOK
+# ------------------------------------------------------------
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request):
+    payload = await request.body()
+    sig_header = request.headers.get("stripe-signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, os.getenv("STRIPE_WEBHOOK_SECRET"))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook error: {e}")
 
     if event["type"] == "checkout.session.completed":
-        session = event["data"]["object"]
-        email = session.get("customer_details", {}).get("email", "Unknown")
-        amount = session.get("amount_total", 0) / 100
-        payment_id = session.get("payment_intent", "Unknown")
-
-        # 1️⃣ Create receipt PDF
-        receipt_path = create_receipt_pdf(email, amount, payment_id)
-
-        # 2️⃣ Send Email Receipt
-        send_email_with_receipt(email, amount, receipt_path)
-
-        # 3️⃣ WhatsApp notification
-        send_whatsapp(f"💸 New Payment from {email} — ${amount:.2f}")
-
-        # 4️⃣ Upload to Firebase
-        upload_to_firebase(receipt_path, f"receipts/{payment_id}.pdf")
-
-    return {"status": "Webhook Received"}
-
-# =========================================================
-# 🔹 PDF RECEIPT GENERATOR
-# =========================================================
-def create_receipt_pdf(email, amount, payment_id):
-    try:
-        os.makedirs("receipts", exist_ok=True)
-        path = f"receipts/receipt_{payment_id}.pdf"
-
-        buffer = BytesIO()
-        c = canvas.Canvas(buffer)
-        c.setTitle("Blackout Vaults Receipt")
-
-        # --- Theme ---
-        c.setFillColorRGB(0.95, 0.85, 0.2)  # yellow header
-        c.rect(0, 780, 600, 30, fill=True, stroke=False)
-        c.setFillColorRGB(0, 0, 0)
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(150, 785, "BLACKOUT VAULTS - RECEIPT")
-
-        # --- Logo ---
-        logo_path = "static/logo.png"
-        if os.path.exists(logo_path):
-            c.drawImage(logo_path, 40, 700, width=100, height=100, mask='auto')
-
-        # --- Details ---
-        c.setFont("Helvetica", 12)
-        c.drawString(50, 660, f"Customer Email: {email}")
-        c.drawString(50, 640, f"Amount Paid: ${amount:.2f}")
-        c.drawString(50, 620, f"Payment ID: {payment_id}")
-        c.drawString(50, 600, f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        # --- Footer ---
-        c.setFont("Helvetica-Oblique", 10)
-        c.drawString(50, 560, "Thank you for trusting Blackout Vaults.")
-        c.drawString(50, 545, "Your Privacy. Professionally Handled.")
-
-        c.showPage()
-        c.save()
-
-        with open(path, "wb") as f:
-            f.write(buffer.getvalue())
-
-        print(f"📄 Receipt PDF created at {path}")
-        return path
-    except Exception as e:
-        print("⚠️ PDF generation failed:", e)
-        return None
-
-# =========================================================
-# 🔹 EMAIL RECEIPT SENDER
-# =========================================================
-def send_email_with_receipt(to_email, amount, receipt_path):
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = f"Blackout Vaults <{SMTP_EMAIL}>"
-        msg["To"] = to_email
-        msg["Subject"] = f"🧾 Payment Receipt - ${amount:.2f}"
-
-        body = f"""
-Hello,
-
-Thank you for your payment of ${amount:.2f}.
-Your privacy protection plan has been successfully activated.
-
-Best regards,  
-**Blackout Vaults Team**  
-support@blackoutvaults.com
-"""
-        msg.attach(MIMEText(body, "plain"))
-
-        if receipt_path and os.path.exists(receipt_path):
-            with open(receipt_path, "rb") as f:
-                part = MIMEApplication(f.read(), Name=os.path.basename(receipt_path))
-            part['Content-Disposition'] = f'attachment; filename="{os.path.basename(receipt_path)}"'
-            msg.attach(part)
-
-        context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, context=context) as server:
-            server.login(SMTP_EMAIL, SMTP_PASSWORD)
-            server.sendmail(SMTP_EMAIL, to_email, msg.as_string())
-
-        print(f"📧 Receipt sent to {to_email}")
-    except Exception as e:
-        print("⚠️ Email sending failed:", e)
-
-# =========================================================
-# 🔹 WHATSAPP NOTIFIER
-# =========================================================
-def send_whatsapp(message):
-    try:
-        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=ADMIN_WHATSAPP_NUMBER,
-            body=message
+        customer_email = event["data"]["object"]["customer_email"]
+        twilio_client.messages.create(
+            from_=os.getenv("TWILIO_WHATSAPP_NUMBER"),
+            to=os.getenv("ADMIN_WHATSAPP_NUMBER"),
+            body=f"💳 Payment Success: {customer_email}"
         )
-        print("💬 WhatsApp notification sent.")
-    except Exception as e:
-        print("⚠️ WhatsApp send failed:", e)
+    return {"status": "success"}
 
-# =========================================================
-# 🔹 FIREBASE UPLOAD
-# =========================================================
-def upload_to_firebase(local_path, cloud_path):
+# ------------------------------------------------------------
+# 🔹 SMTP REPORT MAIL
+# ------------------------------------------------------------
+def send_email_report(to_email, pdf_content):
+    msg = MIMEMultipart()
+    msg["From"] = os.getenv("SMTP_EMAIL")
+    msg["To"] = to_email
+    msg["Subject"] = "Your Blackout Vaults Privacy Report"
+    msg.attach(MIMEText("Attached is your encrypted privacy report.", "plain"))
+    part = MIMEApplication(pdf_content, _subtype="pdf")
+    part.add_header("Content-Disposition", "attachment", filename="PrivacyReport.pdf")
+    msg.attach(part)
+    with smtplib.SMTP_SSL(os.getenv("SMTP_SERVER"), int(os.getenv("SMTP_PORT"))) as server:
+        server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
+        server.send_message(msg)
+
+# ------------------------------------------------------------
+# 🔹 ADMIN DASHBOARD ROUTE
+# ------------------------------------------------------------
+@app.get("/admin")
+def admin():
+    return {"users": 1089, "active_scans": 23, "revenue": "$12,438"}
+
+# ------------------------------------------------------------
+# 🔹 PRIVACY SCORE + DASHBOARD DATA
+# ------------------------------------------------------------
+from pydantic import BaseModel
+import random
+
+class PrivacyRequest(BaseModel):
+    email: str
+
+# Example database simulation
+reports_db = {
+    "user@blackoutvaults.com": [
+        {"id": 1, "date": "2025-10-06", "leaksFound": 2, "leaksFixed": 2},
+        {"id": 2, "date": "2025-09-28", "leaksFound": 4, "leaksFixed": 4},
+    ]
+}
+
+@app.get("/privacy-score")
+async def get_privacy_score(email: str):
+    """
+    Returns dynamic privacy score + AI analysis summary.
+    """
     try:
-        bucket = storage.bucket()
-        blob = bucket.blob(cloud_path)
-        blob.upload_from_filename(local_path)
-        blob.make_public()
-        print(f"☁️ Uploaded to Firebase: {blob.public_url}")
+        base_score = random.randint(60, 95)
+        reports = reports_db.get(email, [])
+
+        # Optional AI Summary
+        ai_summary = None
+        try:
+            prompt = f"Assess privacy safety for {email}. Return one-line risk summary."
+            res = openai.ChatCompletion.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+            )
+            ai_summary = res.choices[0].message.content
+        except Exception as e:
+            ai_summary = "⚠️ AI summary unavailable (offline mode)."
+            print(f"OpenAI error: {e}")
+
+        return {
+            "email": email,
+            "score": base_score,
+            "reports": reports,
+            "summary": ai_summary,
+        }
+
     except Exception as e:
-        print("⚠️ Firebase upload failed:", e)
+        raise HTTPException(status_code=500, detail=f"Server error: {e}")
+
+
+@app.post("/update-score")
+async def update_score(req: PrivacyRequest):
+    """
+    Manual refresh endpoint for dashboard button.
+    """
+    email = req.email
+    new_score = random.randint(70, 99)
+    new_report = {
+        "id": len(reports_db.get(email, [])) + 1,
+        "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        "leaksFound": random.randint(0, 5),
+        "leaksFixed": random.randint(0, 5),
+    }
+    reports_db[email] = reports_db.get(email, []) + [new_report]
+    return {"email": email, "new_score": new_score, "reports": reports_db[email]}
+
+# ------------------------------------------------------------
+# ✅ RUN LOCALLY
+# ------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=10000)

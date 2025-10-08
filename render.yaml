@@ -6,21 +6,14 @@ services:
     region: oregon
     autoDeploy: true
 
-    # --- Build & Start ---
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app --timeout 120
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn -w 2 -k uvicorn.workers.UvicornWorker main:app
 
-    # --- Environment Variables ---
     envVars:
-      # System
       - key: PYTHON_VERSION
         value: 3.11
-      - key: ENVIRONMENT
-        value: production
-      - key: PORT
-        value: 10000
 
-      # Stripe
+      # Stripe Keys
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_PUBLISHABLE_KEY
@@ -36,19 +29,17 @@ services:
       - key: FIREBASE_STORAGE_BUCKET
         sync: false
 
-      # Email (SMTP)
+      # SMTP (Email)
       - key: SMTP_SERVER
-        sync: false
+        value: mail.blackoutvaults.com
       - key: SMTP_PORT
-        sync: false
+        value: "465"
       - key: SMTP_EMAIL
-        sync: false
+        value: support@blackoutvaults.com
       - key: SMTP_PASSWORD
         sync: false
-      - key: SUPPORT_EMAIL
-        value: support@blackoutvaults.com
 
-      # WhatsApp (Twilio)
+      # Twilio (WhatsApp)
       - key: TWILIO_ACCOUNT_SID
         sync: false
       - key: TWILIO_AUTH_TOKEN
@@ -58,6 +49,8 @@ services:
       - key: ADMIN_WHATSAPP_NUMBER
         sync: false
 
-      # Base URL
-      - key: BASE_URL
-        value: https://blackoutvaults-backend.onrender.com
+      # General
+      - key: ENVIRONMENT
+        value: production
+      - key: PORT
+        value: "10000"

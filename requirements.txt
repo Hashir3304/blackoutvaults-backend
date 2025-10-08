@@ -1,9 +1,0 @@
-fastapi
-uvicorn
-stripe
-twilio
-firebase-admin
-python-dotenv
-reportlab
-gunicorn
-pillow
